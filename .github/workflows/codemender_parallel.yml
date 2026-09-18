@@ -1,0 +1,193 @@
+name: CodeMender Parallel Remediation Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      runner_image:
+        type: string
+        default: 'ghcr.io/ilbzzz/codemender-runner:latest'
+        required: false
+      runner_type:
+        type: string
+        default: 'ubuntu-latest'
+        required: false
+      scan_target:
+        type: string
+        default: '.'
+        required: false
+      build_command:
+        type: string
+        default: ''
+        required: false
+      max_tasks:
+        type: number
+        default: 10
+        required: false
+      intermediate_artifact_retention_days:
+        type: number
+        default: 3
+        required: false
+      report_artifact_retention_days:
+        type: number
+        default: 90
+        required: false
+      upload_sarif:
+        type: boolean
+        default: true
+        required: false
+      fail_on_findings:
+        type: boolean
+        default: true
+        required: false
+      pr_remediation_mode:
+        type: string
+        default: 'review_suggestion'
+        required: false
+      model:
+        type: string
+        default: ''
+        required: false
+      find_model:
+        type: string
+        default: ''
+        required: false
+      verify_model:
+        type: string
+        default: ''
+        required: false
+      fix_model:
+        type: string
+        default: ''
+        required: false
+      skip_exploit_verification:
+        type: boolean
+        default: false
+        required: false
+      skip_verify:
+        type: boolean
+        default: true
+        required: false
+    secrets:
+      gcp_workload_identity_provider:
+        required: false
+      gcp_service_account:
+        required: false
+      gcp_sa_key:
+        required: false
+      github_app_id:
+        required: false
+      github_app_private_key:
+        required: false
+      custom_github_token:
+        required: false
+
+jobs:
+  scan:
+    runs-on: ${{ inputs.runner_type }}
+    container:
+      image: ${{ inputs.runner_image }}
+      options: --privileged
+    outputs:
+      matrix: ${{ steps.scan.outputs.matrix }}
+      findings_count: ${{ steps.scan.outputs.findings_count }}
+      target_sha: ${{ steps.scan.outputs.target_sha }}
+    steps:
+      - name: Authenticate with GCP via Workload Identity Federation
+        if: ${{ secrets.gcp_workload_identity_provider != '' && secrets.gcp_service_account != '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.gcp_workload_identity_provider }}
+          service_account: ${{ secrets.gcp_service_account }}
+
+      - name: Safe Git Directory Configuration
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Execute CodeMender Stage 1 Scan Coordinator
+        id: scan
+        env:
+          CODEMENDER_RUN_MODE: scan
+          CODEMENDER_STORAGE_MODE: github_actions
+          CODEMENDER_SCAN_TARGET: ${{ inputs.scan_target }}
+          CODEMENDER_BUILD_COMMAND: ${{ inputs.build_command }}
+          CODEMENDER_MAX_TASKS: ${{ inputs.max_tasks }}
+          CODEMENDER_MODEL: ${{ inputs.model }}
+          CODEMENDER_FIND_MODEL: ${{ inputs.find_model }}
+          CODEMENDER_PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          CODEMENDER_PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          CODEMENDER_PR_NUMBER: ${{ github.event.pull_request.number }}
+          CODEMENDER_IS_FORK_PR: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          python3 /opt/codemender/orchestrator.py || true
+
+  worker:
+    needs: scan
+    if: needs.scan.outputs.findings_count != '0' && needs.scan.outputs.findings_count != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        worker_index: ${{ fromJson(needs.scan.outputs.matrix) }}
+    runs-on: ${{ inputs.runner_type }}
+    container:
+      image: ${{ inputs.runner_image }}
+      options: --privileged
+    steps:
+      - name: Authenticate with GCP via Workload Identity Federation
+        if: ${{ secrets.gcp_workload_identity_provider != '' && secrets.gcp_service_account != '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.gcp_workload_identity_provider }}
+          service_account: ${{ secrets.gcp_service_account }}
+
+      - name: Safe Git Directory Configuration
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Execute CodeMender Stage 2 Parallel Worker Task
+        env:
+          CODEMENDER_RUN_MODE: worker
+          CODEMENDER_WORKER_INDEX: ${{ matrix.worker_index }}
+          CODEMENDER_STORAGE_MODE: github_actions
+          CODEMENDER_BUILD_COMMAND: ${{ inputs.build_command }}
+          CODEMENDER_SKIP_EXPLOIT_VERIFICATION: ${{ inputs.skip_exploit_verification }}
+          CODEMENDER_SKIP_VERIFY: ${{ inputs.skip_verify }}
+          CODEMENDER_PR_REMEDIATION_MODE: ${{ inputs.pr_remediation_mode }}
+          CODEMENDER_MODEL: ${{ inputs.model }}
+          CODEMENDER_VERIFY_MODEL: ${{ inputs.verify_model }}
+          CODEMENDER_FIX_MODEL: ${{ inputs.fix_model }}
+          CODEMENDER_PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          CODEMENDER_PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          CODEMENDER_PR_NUMBER: ${{ github.event.pull_request.number }}
+          CODEMENDER_IS_FORK_PR: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+        run: |
+          python3 /opt/codemender/orchestrator.py || true
+
+  aggregate:
+    needs: [scan, worker]
+    if: always() && needs.scan.result == 'success' && needs.scan.outputs.findings_count != '0' && needs.scan.outputs.findings_count != ''
+    runs-on: ${{ inputs.runner_type }}
+    container:
+      image: ${{ inputs.runner_image }}
+      options: --privileged
+    steps:
+      - name: Authenticate with GCP via Workload Identity Federation
+        if: ${{ secrets.gcp_workload_identity_provider != '' && secrets.gcp_service_account != '' }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.gcp_workload_identity_provider }}
+          service_account: ${{ secrets.gcp_service_account }}
+
+      - name: Safe Git Directory Configuration
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Execute CodeMender Stage 3 Aggregator
+        env:
+          CODEMENDER_RUN_MODE: aggregate
+          CODEMENDER_STORAGE_MODE: github_actions
+          CODEMENDER_FAIL_ON_FINDINGS: ${{ inputs.fail_on_findings }}
+          CODEMENDER_PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          python3 /opt/codemender/orchestrator.py || true

@@ -1,0 +1,37 @@
+name: CodeMender Security Remediation
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  pull_request:
+    types: [opened, reopened, labeled, synchronize]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+  security-events: write
+  actions: read
+  packages: read
+
+jobs:
+  remediate:
+    if: >
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && (
+        contains(github.event.pull_request.labels.*.name, 'codemender-scan') ||
+        ((github.event.action == 'opened' || github.event.action == 'reopened') &&
+         (github.base_ref == 'main' || github.base_ref == 'master'))
+      ))
+
+    uses: ./.github/workflows/codemender_parallel.yml
+    with:
+      runner_image: 'ghcr.io/ilbzzz/codemender-runner:latest'
+      build_command: ''
+    secrets:
+      gcp_workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      gcp_service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      github_app_id: ${{ secrets.GH_APP_ID }}
+      github_app_private_key: ${{ secrets.GH_APP_PRIVATE_KEY }}
