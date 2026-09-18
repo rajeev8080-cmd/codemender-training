@@ -1,0 +1,288 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+main:
+  params: [args]
+  steps:
+    - init_variables:
+        assign:
+          - default_empty_map: {}
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+          - region: ${default(map.get(args, "region"), "us-central1")}
+          - job_name: ${args.job_name}
+          - worker_job_name: ${default(map.get(args, "worker_job_name"), text.replace_all(args.job_name, "-runner", "") + "-worker")}
+          - gcs_bucket: ${args.gcs_bucket}
+          - repo_url: ${args.repo_url}
+          - build_command: ${args.build_command}
+          - scan_target: ${default(map.get(args, "scan_target"), ".")}
+          - max_tasks: ${int(default(map.get(args, "max_tasks"), 20))}
+          - timeout_seconds: ${int(default(map.get(args, "timeout_seconds"), 86400))}
+          - scan_id: ${"scan-" + sys.get_env("GOOGLE_CLOUD_WORKFLOW_EXECUTION_ID")}
+          - cli_version: ${default(map.get(args, "cli_version"), "preview")}
+          - model: ${default(map.get(args, "model"), "")}
+          - models: ${default(map.get(args, "models"), default_empty_map)}
+          - skip_exploit_verification: ${default(map.get(args, "skip_exploit_verification"), false)}
+          - skip_verify: ${default(map.get(args, "skip_verify"), true)}
+          - find_model: ${default(map.get(models, "find"), model)}
+          - verify_model: ${default(map.get(models, "verify"), model)}
+          - fix_model: ${default(map.get(models, "fix"), model)}
+
+    - log_start:
+        call: sys.log
+        args:
+          text: '${"Starting parallel scan for repository: " + repo_url + " (Scan ID: " + scan_id + ")"}'
+          severity: INFO
+
+    - run_stage1_scan:
+        try:
+          call: googleapis.run.v2.projects.locations.jobs.run
+          args:
+            name: ${"projects/" + project_id + "/locations/" + region + "/jobs/" + job_name}
+            body:
+              overrides:
+                taskCount: 1
+                timeout: ${string(timeout_seconds) + "s"}
+                containerOverrides:
+                  - env:
+                      - name: CODEMENDER_RUN_MODE
+                        value: "scan"
+                      - name: CODEMENDER_SCAN_ID
+                        value: ${scan_id}
+                      - name: CODEMENDER_GCS_BUCKET
+                        value: ${gcs_bucket}
+                      - name: GITHUB_REPO_URL
+                        value: ${repo_url}
+                      - name: CODEMENDER_BUILD_COMMAND
+                        value: ${build_command}
+                      - name: CODEMENDER_SCAN_TARGET
+                        value: ${scan_target}
+                      - name: CODEMENDER_MAX_TASKS
+                        value: ${string(max_tasks)}
+                      - name: CODEMENDER_CLI_VERSION
+                        value: ${cli_version}
+                      - name: CODEMENDER_MODEL
+                        value: ${model}
+                      - name: CODEMENDER_FIND_MODEL
+                        value: ${find_model}
+                      - name: CODEMENDER_VERIFY_MODEL
+                        value: ${verify_model}
+                      - name: CODEMENDER_FIX_MODEL
+                        value: ${fix_model}
+                      - name: CODEMENDER_SKIP_EXPLOIT_VERIFICATION
+                        value: ${string(skip_exploit_verification)}
+                      - name: CODEMENDER_SKIP_VERIFY
+                        value: ${string(skip_verify)}
+            connector_params:
+              skip_polling: true
+          result: stage1_operation
+        retry:
+          predicate: ${http.default_retry_predicate}
+          max_retries: 3
+          backoff:
+            initial_delay: 10
+            max_delay: 60
+            multiplier: 2
+
+    - wait_stage1:
+        call: wait_for_operation
+        args:
+          operation_name: ${stage1_operation.name}
+          timeout_seconds: ${timeout_seconds}
+        result: stage1_execution
+
+    - read_manifest:
+        try:
+          call: googleapis.storage.v1.objects.get
+          args:
+            bucket: ${gcs_bucket}
+            object: ${text.url_encode("scans/" + scan_id + "/manifest.json")}
+            alt: "media"
+          result: manifest_response
+        retry:
+          predicate: ${http.default_retry_predicate}
+          max_retries: 3
+          backoff:
+            initial_delay: 5
+            max_delay: 20
+            multiplier: 2
+
+    - parse_manifest:
+        assign:
+          - manifest: ${manifest_response}
+          - findings_count: ${int(manifest.findings_count)}
+          - target_sha: ${manifest.target_sha}
+
+    - check_findings:
+        switch:
+          - condition: ${findings_count == 0}
+            next: finish_workflow
+
+    - prepare_worker_vars:
+        assign:
+          - base_workspace_url: ${manifest.base_workspace_url}
+          - partition_urls_str: ${json.encode_to_string(manifest.partition_urls)}
+          - upload_urls_str: ${json.encode_to_string(manifest.upload_urls)}
+          - metadata_urls_str: ${json.encode_to_string(default(map.get(manifest, "metadata_urls"), []))}
+          - total_partitions: ${len(manifest.partition_urls)}
+
+    - determine_num_workers:
+        switch:
+          - condition: ${total_partitions > max_tasks}
+            assign:
+              - num_workers: ${max_tasks}
+          - condition: true
+            assign:
+              - num_workers: ${total_partitions}
+
+    - run_stage2_workers:
+        call: googleapis.run.v2.projects.locations.jobs.run
+        args:
+          name: ${"projects/" + project_id + "/locations/" + region + "/jobs/" + worker_job_name}
+          body:
+            overrides:
+              taskCount: ${num_workers}
+              timeout: ${string(timeout_seconds) + "s"}
+              containerOverrides:
+                - env:
+                    - name: CODEMENDER_RUN_MODE
+                      value: "worker"
+                    - name: CODEMENDER_SCAN_ID
+                      value: ${scan_id}
+                    - name: CODEMENDER_GCS_BUCKET
+                      value: ${gcs_bucket}
+                    - name: GITHUB_REPO_URL
+                      value: ${repo_url}
+                    - name: CODEMENDER_BUILD_COMMAND
+                      value: ${build_command}
+                    - name: CODEMENDER_TARGET_SHA
+                      value: ${target_sha}
+                    - name: CODEMENDER_BASE_WORKSPACE_URL
+                      value: ${base_workspace_url}
+                    - name: CODEMENDER_PARTITION_URLS
+                      value: ${partition_urls_str}
+                    - name: CODEMENDER_UPLOAD_URLS
+                      value: ${upload_urls_str}
+                    - name: CODEMENDER_METADATA_URLS
+                      value: ${metadata_urls_str}
+                    - name: CODEMENDER_CLI_VERSION
+                      value: ${cli_version}
+                    - name: CODEMENDER_MODEL
+                      value: ${model}
+                    - name: CODEMENDER_FIND_MODEL
+                      value: ${find_model}
+                    - name: CODEMENDER_VERIFY_MODEL
+                      value: ${verify_model}
+                    - name: CODEMENDER_FIX_MODEL
+                      value: ${fix_model}
+                    - name: CODEMENDER_SKIP_EXPLOIT_VERIFICATION
+                      value: ${string(skip_exploit_verification)}
+                    - name: CODEMENDER_SKIP_VERIFY
+                      value: ${string(skip_verify)}
+          connector_params:
+            skip_polling: true
+        result: stage2_operation
+
+    - wait_stage2:
+        call: wait_for_operation
+        args:
+          operation_name: ${stage2_operation.name}
+          timeout_seconds: ${timeout_seconds}
+        result: stage2_execution
+
+    - run_stage3_aggregate:
+        call: googleapis.run.v2.projects.locations.jobs.run
+        args:
+          name: ${"projects/" + project_id + "/locations/" + region + "/jobs/" + job_name}
+          body:
+            overrides:
+              taskCount: 1
+              timeout: ${string(timeout_seconds) + "s"}
+              containerOverrides:
+                - env:
+                    - name: CODEMENDER_RUN_MODE
+                      value: "aggregate"
+                    - name: CODEMENDER_SCAN_ID
+                      value: ${scan_id}
+                    - name: CODEMENDER_GCS_BUCKET
+                      value: ${gcs_bucket}
+                    - name: GITHUB_REPO_URL
+                      value: ${repo_url}
+                    - name: CODEMENDER_BUILD_COMMAND
+                      value: ${build_command}
+                    - name: CODEMENDER_TOTAL_WORKERS
+                      value: ${string(num_workers)}
+                    - name: CODEMENDER_CLI_VERSION
+                      value: ${cli_version}
+                    - name: CODEMENDER_MODEL
+                      value: ${model}
+                    - name: CODEMENDER_FIND_MODEL
+                      value: ${find_model}
+                    - name: CODEMENDER_VERIFY_MODEL
+                      value: ${verify_model}
+                    - name: CODEMENDER_FIX_MODEL
+                      value: ${fix_model}
+                    - name: CODEMENDER_SKIP_EXPLOIT_VERIFICATION
+                      value: ${string(skip_exploit_verification)}
+                    - name: CODEMENDER_SKIP_VERIFY
+                      value: ${string(skip_verify)}
+          connector_params:
+            skip_polling: true
+        result: stage3_operation
+
+    - wait_stage3:
+        call: wait_for_operation
+        args:
+          operation_name: ${stage3_operation.name}
+          timeout_seconds: ${timeout_seconds}
+        result: stage3_execution
+
+    - finish_workflow:
+        return: "Workflow completed successfully."
+
+wait_for_operation:
+  params: [operation_name, timeout_seconds]
+  steps:
+    - init_loop:
+        assign:
+          - elapsed: 0
+          - sleep_interval: 60
+    - get_operation:
+        call: googleapis.run.v2.projects.locations.operations.get
+        args:
+          name: ${operation_name}
+        result: operation
+    - check_status:
+        switch:
+          - condition: ${default(map.get(operation, "done"), false) == true}
+            next: check_operation_result
+          - condition: ${elapsed >= timeout_seconds}
+            raise: '${"Operation " + operation_name + " timed out after " + string(timeout_seconds) + " seconds."}'
+        next: wait_more
+    - wait_more:
+        call: sys.sleep
+        args:
+          seconds: ${sleep_interval}
+    - increment_timer:
+        assign:
+          - elapsed: ${elapsed + sleep_interval}
+        next: get_operation
+
+    - check_operation_result:
+        switch:
+          - condition: ${"error" in operation}
+            raise: '${"Operation failed: " + operation.error.message}'
+          - condition: ${int(default(map.get(operation, ["response", "failedCount"]), 0)) > 0}
+            raise: '${"Job execution failed with " + string(operation.response.failedCount) + " failed tasks."}'
+    - return_result:
+        return: ${operation.response}
